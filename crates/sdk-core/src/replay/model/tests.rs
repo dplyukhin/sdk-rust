@@ -7,19 +7,22 @@ use crate::{
     test_help::{start_timer_cmd, test_worker_cfg},
 };
 use temporalio_common::protos::{
+    constants::LOCAL_ACTIVITY_MARKER_NAME,
     coresdk::{
         activity_result::activity_resolution,
+        common::build_has_change_marker_details,
         workflow_activation::{remove_from_cache::EvictionReason, workflow_activation_job},
         workflow_commands,
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
         command::v1::{
-            CancelTimerCommandAttributes, CompleteWorkflowExecutionCommandAttributes,
-            FailWorkflowExecutionCommandAttributes, RecordMarkerCommandAttributes,
-            ScheduleActivityTaskCommandAttributes, StartTimerCommandAttributes,
+            CancelTimerCommandAttributes, Command, CompleteWorkflowExecutionCommandAttributes,
+            FailWorkflowExecutionCommandAttributes, ModifyWorkflowPropertiesCommandAttributes,
+            RecordMarkerCommandAttributes, ScheduleActivityTaskCommandAttributes,
+            StartTimerCommandAttributes, UpsertWorkflowSearchAttributesCommandAttributes,
         },
-        common::v1::{ActivityType, Payload, Payloads},
+        common::v1::{ActivityType, Memo, Payload, Payloads, SearchAttributes},
         failure::v1::Failure,
         sdk::v1::WorkflowTaskCompletedMetadata,
         taskqueue::v1::TaskQueue,
@@ -50,7 +53,14 @@ fn initial() -> ModelHistory {
 fn completion(commands: Vec<command::Attributes>) -> WorkflowTaskCompletion {
     WorkflowTaskCompletion {
         task_token: vec![].into(),
-        commands: commands.into_iter().map(Into::into).collect(),
+        commands: commands
+            .into_iter()
+            .map(|attributes| Command {
+                command_type: attributes.as_type() as i32,
+                attributes: Some(attributes),
+                ..Default::default()
+            })
+            .collect(),
         messages: vec![],
         sticky_attributes: None,
         query_responses: vec![],
@@ -135,6 +145,66 @@ fn commit_preserves_task_links_and_sdk_flags() {
         model.timer_choices(),
         vec![ModelEvent::FireTimer("1".to_owned())]
     );
+}
+
+#[test]
+fn metadata_commands_do_not_create_choices_or_mutate_sibling_histories() {
+    let root = initial()
+        .complete_task(&completion(vec![timer("deadline", Duration::from_secs(5))]))
+        .unwrap();
+    for deprecated in [false, true] {
+        let branch = root.extend(&[signal("update")]).unwrap();
+        let completed_id = branch.history.events.last().unwrap().event_id + 1;
+        let settled = branch
+            .complete_task(&completion(vec![
+                command::Attributes::RecordMarkerCommandAttributes(RecordMarkerCommandAttributes {
+                    marker_name: PATCH_MARKER_NAME.to_owned(),
+                    details: build_has_change_marker_details("metadata-patch", deprecated).unwrap(),
+                    ..Default::default()
+                }),
+                command::Attributes::UpsertWorkflowSearchAttributesCommandAttributes(
+                    UpsertWorkflowSearchAttributesCommandAttributes {
+                        search_attributes: Some(SearchAttributes {
+                            indexed_fields: [(
+                                "stage".to_owned(),
+                                payloads("approved").payloads.remove(0),
+                            )]
+                            .into(),
+                        }),
+                    },
+                ),
+                command::Attributes::ModifyWorkflowPropertiesCommandAttributes(
+                    ModifyWorkflowPropertiesCommandAttributes {
+                        upserted_memo: Some(Memo {
+                            fields: [("scratch".to_owned(), Payload::default())].into(),
+                        }),
+                    },
+                ),
+            ]))
+            .unwrap();
+        let events = &settled.history.events;
+        assert_matches!(
+            &events[events.len() - 3].attributes,
+            Some(history_event::Attributes::MarkerRecordedEventAttributes(a))
+                if a.workflow_task_completed_event_id == completed_id
+                    && decode_change_marker_details(&a.details)
+                        == Some(("metadata-patch".to_owned(), deprecated))
+        );
+        assert_matches!(
+            &events[events.len() - 2].attributes,
+            Some(history_event::Attributes::UpsertWorkflowSearchAttributesEventAttributes(a))
+                if a.workflow_task_completed_event_id == completed_id
+        );
+        assert_matches!(
+            &events[events.len() - 1].attributes,
+            Some(history_event::Attributes::WorkflowPropertiesModifiedEventAttributes(a))
+                if a.workflow_task_completed_event_id == completed_id
+                    && a.upserted_memo.as_ref().unwrap().fields["scratch"] == Payload::default()
+        );
+        assert_eq!(settled.timer_choices(), root.timer_choices());
+        assert!(!settled.task_pending());
+        assert_eq!(root.history.events.len(), 5);
+    }
 }
 
 #[test]
@@ -325,11 +395,21 @@ fn invalid_choices_and_unsupported_commands_are_rejected() {
     assert_matches!(
         initial.complete_task(&completion(vec![
             timer("1", Duration::from_secs(1)),
-            command::Attributes::RecordMarkerCommandAttributes(
-                RecordMarkerCommandAttributes::default()
-            ),
+            command::Attributes::RecordMarkerCommandAttributes(RecordMarkerCommandAttributes {
+                marker_name: LOCAL_ACTIVITY_MARKER_NAME.to_owned(),
+                ..Default::default()
+            }),
         ])),
         Err(ModelError::UnsupportedCommand(CommandType::RecordMarker))
+    );
+    assert_matches!(
+        initial.complete_task(&completion(vec![
+            command::Attributes::RecordMarkerCommandAttributes(RecordMarkerCommandAttributes {
+                marker_name: PATCH_MARKER_NAME.to_owned(),
+                ..Default::default()
+            }),
+        ])),
+        Err(ModelError::InvalidCommand(CommandType::RecordMarker))
     );
     assert_matches!(
         initial.complete_task(&completion(vec![

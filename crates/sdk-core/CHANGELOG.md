@@ -36,6 +36,7 @@ relevant information.
 ### Added
 * Language SDKs can offer experimental, serverless exploration of timer and signal schedules, returning the history and failure of the first failed or timed-out workflow task.
 * Serverless workflow checking can explore remote activity completion orders and sampled return payloads without running activity implementations; generated histories replay the recorded results.
+* Serverless workflow checking supports workflows that update search attributes and memos or use patch markers, preserving those changes in counterexample histories.
 
 ## [0.11.0] - 2026-11-09
 

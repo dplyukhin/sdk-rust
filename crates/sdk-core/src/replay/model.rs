@@ -1,25 +1,32 @@
 //! A history-only model for exploring timers, signals, and remote activity results.
 //!
 //! Transitions return new histories so callers can backtrack without restoring cached execution
-//! state. Activity failures, timeouts, retries, cancellation, local activities, updates, execution
-//! retries, and workflow-task retries are not modeled.
+//! state. Search attribute and memo updates and patch markers are recorded without adding choices.
+//! Activity failures, timeouts, retries, cancellation, local activities, updates, execution retries,
+//! and workflow-task retries are not modeled.
 
 use crate::WorkflowTaskCompletion;
 use prost::Message;
 use prost_types::Timestamp;
 use std::{collections::BTreeMap, time::Duration};
-use temporalio_common::protos::temporal::api::{
-    command::v1::{CommandAttributesExt, command},
-    common::v1::Payloads,
-    enums::v1::{CommandType, EventType, RetryState, VersioningBehavior},
-    history::v1::{
-        ActivityTaskCompletedEventAttributes, ActivityTaskScheduledEventAttributes,
-        ActivityTaskStartedEventAttributes, History, HistoryEvent, TimerCanceledEventAttributes,
-        TimerFiredEventAttributes, TimerStartedEventAttributes,
-        WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
-        WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
-        WorkflowTaskCompletedEventAttributes, WorkflowTaskScheduledEventAttributes,
-        WorkflowTaskStartedEventAttributes, history_event,
+use temporalio_common::protos::{
+    constants::PATCH_MARKER_NAME,
+    coresdk::common::decode_change_marker_details,
+    temporal::api::{
+        command::v1::{CommandAttributesExt, command},
+        common::v1::Payloads,
+        enums::v1::{CommandType, EventType, RetryState, VersioningBehavior},
+        history::v1::{
+            ActivityTaskCompletedEventAttributes, ActivityTaskScheduledEventAttributes,
+            ActivityTaskStartedEventAttributes, History, HistoryEvent,
+            MarkerRecordedEventAttributes, TimerCanceledEventAttributes, TimerFiredEventAttributes,
+            TimerStartedEventAttributes, UpsertWorkflowSearchAttributesEventAttributes,
+            WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
+            WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
+            WorkflowPropertiesModifiedEventAttributes, WorkflowTaskCompletedEventAttributes,
+            WorkflowTaskScheduledEventAttributes, WorkflowTaskStartedEventAttributes,
+            history_event,
+        },
     },
 };
 
@@ -311,6 +318,35 @@ impl ModelHistory {
                         workflow_task_completed_event_id: completed_id,
                         priority: a.priority.clone(),
                         ..Default::default()
+                    }
+                    .into()
+                }
+                command::Attributes::UpsertWorkflowSearchAttributesCommandAttributes(a) => {
+                    UpsertWorkflowSearchAttributesEventAttributes {
+                        workflow_task_completed_event_id: completed_id,
+                        search_attributes: a.search_attributes.clone(),
+                    }
+                    .into()
+                }
+                command::Attributes::ModifyWorkflowPropertiesCommandAttributes(a) => {
+                    WorkflowPropertiesModifiedEventAttributes {
+                        workflow_task_completed_event_id: completed_id,
+                        upserted_memo: a.upserted_memo.clone(),
+                    }
+                    .into()
+                }
+                command::Attributes::RecordMarkerCommandAttributes(a)
+                    if a.marker_name == PATCH_MARKER_NAME =>
+                {
+                    if decode_change_marker_details(&a.details).is_none() {
+                        return Err(ModelError::InvalidCommand(CommandType::RecordMarker));
+                    }
+                    MarkerRecordedEventAttributes {
+                        marker_name: a.marker_name.clone(),
+                        details: a.details.clone(),
+                        workflow_task_completed_event_id: completed_id,
+                        header: a.header.clone(),
+                        failure: a.failure.clone(),
                     }
                     .into()
                 }
