@@ -1,12 +1,13 @@
-//! Experimental depth-first exploration of timer and signal histories.
+//! Experimental depth-first exploration of timer, signal, and remote activity histories.
 
 use super::{
     HistoryFeeder, HistoryForReplay, ReplayWorkerInput,
     model::{ModelError, ModelEvent, ModelHistory},
 };
 use crate::{Worker, WorkerConfig, WorkflowTaskCompletion, init_replay_worker};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use temporalio_common::protos::temporal::api::{
+    common::v1::Payloads,
     enums::v1::TimeoutType,
     failure::v1::{Failure, TimeoutFailureInfo, failure},
     history::v1::{History, WorkflowExecutionSignaledEventAttributes},
@@ -94,14 +95,16 @@ impl WorkflowCheck {
 
     /// Stop at the first task failure. `None` means no counterexample was found within the bounds.
     ///
-    /// Every configured signal remains eligible at every open frontier. Timer resolutions are
-    /// explored before incoming signals, so repeated signals cannot monopolize the search.
-    /// This prototype explores singleton event batches only.
+    /// Every configured signal remains eligible at every open frontier. Timer and activity
+    /// resolutions are explored before incoming signals, so repeated signals cannot monopolize
+    /// the search. Activity implementations are never executed; results come from the supplied
+    /// payload sets. This prototype explores singleton event batches only.
     pub async fn run(
         &mut self,
         workflow_id: &str,
         initial: ModelHistory,
         signals: &[WorkflowExecutionSignaledEventAttributes],
+        activity_results: &BTreeMap<String, Vec<Payloads>>,
         limits: CheckLimits,
     ) -> Result<Option<Counterexample>, CheckError> {
         if limits.max_checks == 0 || limits.timeout.is_zero() || limits.task_timeout.is_zero() {
@@ -161,6 +164,7 @@ impl WorkflowCheck {
             let choices = settled
                 .timer_choices()
                 .into_iter()
+                .chain(settled.activity_choices(activity_results)?)
                 .chain(signals.iter().cloned().map(ModelEvent::Signal))
                 .collect::<Vec<_>>();
             for choice in choices.into_iter().rev() {

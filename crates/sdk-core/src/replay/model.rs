@@ -1,7 +1,8 @@
-//! A history-only model for exploring timers and signals between workflow tasks.
+//! A history-only model for exploring timers, signals, and remote activity results.
 //!
 //! Transitions return new histories so callers can backtrack without restoring cached execution
-//! state. Activities, updates, execution retries, and workflow-task retries are not modeled.
+//! state. Activity failures, timeouts, retries, cancellation, local activities, updates, execution
+//! retries, and workflow-task retries are not modeled.
 
 use crate::WorkflowTaskCompletion;
 use prost::Message;
@@ -9,13 +10,16 @@ use prost_types::Timestamp;
 use std::{collections::BTreeMap, time::Duration};
 use temporalio_common::protos::temporal::api::{
     command::v1::{CommandAttributesExt, command},
+    common::v1::Payloads,
     enums::v1::{CommandType, EventType, RetryState, VersioningBehavior},
     history::v1::{
-        History, HistoryEvent, TimerCanceledEventAttributes, TimerFiredEventAttributes,
-        TimerStartedEventAttributes, WorkflowExecutionCompletedEventAttributes,
-        WorkflowExecutionFailedEventAttributes, WorkflowExecutionSignaledEventAttributes,
-        WorkflowExecutionStartedEventAttributes, WorkflowTaskCompletedEventAttributes,
-        WorkflowTaskScheduledEventAttributes, WorkflowTaskStartedEventAttributes, history_event,
+        ActivityTaskCompletedEventAttributes, ActivityTaskScheduledEventAttributes,
+        ActivityTaskStartedEventAttributes, History, HistoryEvent, TimerCanceledEventAttributes,
+        TimerFiredEventAttributes, TimerStartedEventAttributes,
+        WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
+        WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
+        WorkflowTaskCompletedEventAttributes, WorkflowTaskScheduledEventAttributes,
+        WorkflowTaskStartedEventAttributes, history_event,
     },
 };
 
@@ -29,6 +33,13 @@ pub enum ModelEvent {
     FireTimer(String),
     /// Signals remain eligible independently of whether the workflow is awaiting them.
     Signal(WorkflowExecutionSignaledEventAttributes),
+    /// Resolve a pending remote activity using a sampled result, without executing its implementation.
+    CompleteActivity {
+        /// The schedule event identifies this invocation even if its activity ID is reused later.
+        scheduled_event_id: i64,
+        /// Payloads to record in history and reuse during replay.
+        result: Payloads,
+    },
 }
 
 /// A branch whose only execution state is its history.
@@ -73,6 +84,15 @@ pub enum ModelError {
     /// Timer deadlines must be representable protobuf timestamps.
     #[error("timer {0:?} must have a positive timeout and a representable deadline")]
     InvalidTimerTimeout(String),
+    /// Live activity IDs must be unique.
+    #[error("activity {0:?} is already pending")]
+    DuplicateActivity(String),
+    /// An activity completion must refer to an unresolved invocation.
+    #[error("activity scheduled at event {0} is not pending")]
+    ActivityNotPending(i64),
+    /// Missing samples must not silently leave an activity unresolved.
+    #[error("no sampled results for activity type {0:?}")]
+    MissingActivityResults(String),
     /// An unnamed signal cannot be dispatched to a handler.
     #[error("a signal must have a name")]
     EmptySignalName,
@@ -162,6 +182,34 @@ impl ModelHistory {
             .collect()
     }
 
+    /// Pending remote activity resolutions in schedule order, using the caller's sampled payloads.
+    pub fn activity_choices(
+        &self,
+        results: &BTreeMap<String, Vec<Payloads>>,
+    ) -> Result<Vec<ModelEvent>, ModelError> {
+        if self.is_closed() || self.task_pending() {
+            return Ok(vec![]);
+        }
+        let mut choices = vec![];
+        for (scheduled_event_id, activity) in self.pending_activities() {
+            let name = &activity.activity_type.as_ref().unwrap().name;
+            let samples = results
+                .get(name)
+                .filter(|samples| !samples.is_empty())
+                .ok_or_else(|| ModelError::MissingActivityResults(name.clone()))?;
+            choices.extend(
+                samples
+                    .iter()
+                    .cloned()
+                    .map(|result| ModelEvent::CompleteActivity {
+                        scheduled_event_id,
+                        result,
+                    }),
+            );
+        }
+        Ok(choices)
+    }
+
     /// Commit the normal Core task completion without modifying the original prefix.
     pub fn complete_task(&self, completion: &WorkflowTaskCompletion) -> Result<Self, ModelError> {
         if self.is_closed() {
@@ -229,6 +277,39 @@ impl ModelHistory {
                         timer_id: a.timer_id.clone(),
                         started_event_id: started_id,
                         workflow_task_completed_event_id: completed_id,
+                        ..Default::default()
+                    }
+                    .into()
+                }
+                command::Attributes::ScheduleActivityTaskCommandAttributes(a) => {
+                    if a.activity_id.is_empty()
+                        || a.activity_type.as_ref().is_none_or(|t| t.name.is_empty())
+                        || a.task_queue.as_ref().is_none_or(|q| q.name.is_empty())
+                    {
+                        return Err(ModelError::InvalidCommand(
+                            CommandType::ScheduleActivityTask,
+                        ));
+                    }
+                    if next
+                        .pending_activities()
+                        .values()
+                        .any(|pending| pending.activity_id == a.activity_id)
+                    {
+                        return Err(ModelError::DuplicateActivity(a.activity_id.clone()));
+                    }
+                    ActivityTaskScheduledEventAttributes {
+                        activity_id: a.activity_id.clone(),
+                        activity_type: a.activity_type.clone(),
+                        task_queue: a.task_queue.clone(),
+                        header: a.header.clone(),
+                        input: a.input.clone(),
+                        schedule_to_close_timeout: a.schedule_to_close_timeout,
+                        schedule_to_start_timeout: a.schedule_to_start_timeout,
+                        start_to_close_timeout: a.start_to_close_timeout,
+                        heartbeat_timeout: a.heartbeat_timeout,
+                        retry_policy: a.retry_policy.clone(),
+                        workflow_task_completed_event_id: completed_id,
+                        priority: a.priority.clone(),
                         ..Default::default()
                     }
                     .into()
@@ -311,6 +392,33 @@ impl ModelHistory {
                     }
                     next.push(attrs.clone().into(), next.time());
                 }
+                ModelEvent::CompleteActivity {
+                    scheduled_event_id,
+                    result,
+                } => {
+                    if !next.pending_activities().contains_key(scheduled_event_id) {
+                        return Err(ModelError::ActivityNotPending(*scheduled_event_id));
+                    }
+                    let started_event_id = next.push(
+                        ActivityTaskStartedEventAttributes {
+                            scheduled_event_id: *scheduled_event_id,
+                            attempt: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                        next.time(),
+                    );
+                    next.push(
+                        ActivityTaskCompletedEventAttributes {
+                            scheduled_event_id: *scheduled_event_id,
+                            started_event_id,
+                            result: Some(result.clone()),
+                            ..Default::default()
+                        }
+                        .into(),
+                        next.time(),
+                    );
+                }
             }
             if scheduled == 0 {
                 scheduled = next.schedule_task();
@@ -337,6 +445,22 @@ impl ModelHistory {
             }
         }
         timers
+    }
+
+    fn pending_activities(&self) -> BTreeMap<i64, &ActivityTaskScheduledEventAttributes> {
+        let mut activities = BTreeMap::new();
+        for event in &self.history.events {
+            match event.attributes.as_ref() {
+                Some(history_event::Attributes::ActivityTaskScheduledEventAttributes(a)) => {
+                    activities.insert(event.event_id, a);
+                }
+                Some(history_event::Attributes::ActivityTaskCompletedEventAttributes(a)) => {
+                    activities.remove(&a.scheduled_event_id);
+                }
+                _ => {}
+            }
+        }
+        activities
     }
 
     fn task_pending(&self) -> bool {

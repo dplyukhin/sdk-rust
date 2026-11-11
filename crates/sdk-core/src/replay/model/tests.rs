@@ -8,6 +8,7 @@ use crate::{
 };
 use temporalio_common::protos::{
     coresdk::{
+        activity_result::activity_resolution,
         workflow_activation::{remove_from_cache::EvictionReason, workflow_activation_job},
         workflow_commands,
         workflow_completion::WorkflowActivationCompletion,
@@ -15,12 +16,13 @@ use temporalio_common::protos::{
     temporal::api::{
         command::v1::{
             CancelTimerCommandAttributes, CompleteWorkflowExecutionCommandAttributes,
-            FailWorkflowExecutionCommandAttributes, ScheduleActivityTaskCommandAttributes,
-            StartTimerCommandAttributes,
+            FailWorkflowExecutionCommandAttributes, RecordMarkerCommandAttributes,
+            ScheduleActivityTaskCommandAttributes, StartTimerCommandAttributes,
         },
-        common::v1::{Payload, Payloads},
+        common::v1::{ActivityType, Payload, Payloads},
         failure::v1::Failure,
         sdk::v1::WorkflowTaskCompletedMetadata,
+        taskqueue::v1::TaskQueue,
     },
 };
 
@@ -74,6 +76,32 @@ fn signal(name: &str) -> ModelEvent {
         signal_name: name.to_owned(),
         ..Default::default()
     })
+}
+
+fn activity(id: &str) -> command::Attributes {
+    command::Attributes::ScheduleActivityTaskCommandAttributes(
+        ScheduleActivityTaskCommandAttributes {
+            activity_id: id.to_owned(),
+            activity_type: Some(ActivityType {
+                name: "model-activity".to_owned(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "model-queue".to_owned(),
+                ..Default::default()
+            }),
+            start_to_close_timeout: Some(Duration::from_secs(10).try_into().unwrap()),
+            ..Default::default()
+        },
+    )
+}
+
+fn payloads(value: &str) -> Payloads {
+    Payloads {
+        payloads: vec![Payload {
+            data: value.as_bytes().to_vec(),
+            ..Default::default()
+        }],
+    }
 }
 
 #[test]
@@ -297,13 +325,11 @@ fn invalid_choices_and_unsupported_commands_are_rejected() {
     assert_matches!(
         initial.complete_task(&completion(vec![
             timer("1", Duration::from_secs(1)),
-            command::Attributes::ScheduleActivityTaskCommandAttributes(
-                ScheduleActivityTaskCommandAttributes::default()
+            command::Attributes::RecordMarkerCommandAttributes(
+                RecordMarkerCommandAttributes::default()
             ),
         ])),
-        Err(ModelError::UnsupportedCommand(
-            CommandType::ScheduleActivityTask
-        ))
+        Err(ModelError::UnsupportedCommand(CommandType::RecordMarker))
     );
     assert_matches!(
         initial.complete_task(&completion(vec![
@@ -351,6 +377,176 @@ fn malformed_and_overflowing_timer_timeouts_are_rejected() {
             Err(ModelError::InvalidTimerTimeout(_))
         );
     }
+}
+
+#[test]
+fn remote_activity_results_branch_without_mutating_the_schedule() {
+    let root = initial()
+        .complete_task(&completion(vec![activity("first"), activity("second")]))
+        .unwrap();
+    let samples = BTreeMap::from([(
+        "model-activity".to_owned(),
+        vec![payloads("one"), payloads("two")],
+    )]);
+    let choices = root.activity_choices(&samples).unwrap();
+    assert_eq!(choices.len(), 4);
+    let first_id = 5;
+    let second_id = 6;
+    assert_eq!(
+        choices[0],
+        ModelEvent::CompleteActivity {
+            scheduled_event_id: first_id,
+            result: payloads("one"),
+        }
+    );
+    assert_eq!(
+        choices[3],
+        ModelEvent::CompleteActivity {
+            scheduled_event_id: second_id,
+            result: payloads("two"),
+        }
+    );
+
+    let branch = root
+        .extend(&[choices[3].clone(), signal("after-activity")])
+        .unwrap();
+    assert_matches!(
+        branch.history.events[6].attributes.as_ref(),
+        Some(history_event::Attributes::ActivityTaskStartedEventAttributes(a))
+            if a.scheduled_event_id == second_id && a.attempt == 1
+    );
+    assert_matches!(
+        branch.history.events[7].attributes.as_ref(),
+        Some(history_event::Attributes::ActivityTaskCompletedEventAttributes(a))
+            if a.scheduled_event_id == second_id && a.started_event_id == 7
+                && a.result == Some(payloads("two"))
+    );
+    let settled = branch.complete_task(&completion(vec![])).unwrap();
+    assert_eq!(settled.activity_choices(&samples).unwrap(), choices[..2]);
+    assert_eq!(root.activity_choices(&samples).unwrap(), choices);
+    assert_matches!(
+        settled.extend(&[choices[3].clone()]),
+        Err(ModelError::ActivityNotPending(id)) if id == second_id
+    );
+
+    let restarted = settled
+        .extend(&[signal("reuse")])
+        .unwrap()
+        .complete_task(&completion(vec![activity("second")]))
+        .unwrap();
+    let restarted_choices = restarted.activity_choices(&samples).unwrap();
+    assert_eq!(restarted_choices.len(), 4);
+    assert_ne!(restarted_choices[2], choices[2]);
+}
+
+#[test]
+fn remote_activity_schedules_require_samples_and_unique_live_ids() {
+    let root = initial()
+        .complete_task(&completion(vec![activity("first")]))
+        .unwrap();
+    assert_matches!(
+        root.activity_choices(&BTreeMap::new()),
+        Err(ModelError::MissingActivityResults(name)) if name == "model-activity"
+    );
+    assert_matches!(
+        root.activity_choices(&BTreeMap::from([("model-activity".to_owned(), vec![])])),
+        Err(ModelError::MissingActivityResults(_))
+    );
+    assert_matches!(
+        root.extend(&[signal("duplicate")])
+            .unwrap()
+            .complete_task(&completion(vec![activity("first")])),
+        Err(ModelError::DuplicateActivity(_))
+    );
+    assert_matches!(
+        root.extend(&[ModelEvent::CompleteActivity {
+            scheduled_event_id: 999,
+            result: payloads("bad")
+        }]),
+        Err(ModelError::ActivityNotPending(999))
+    );
+    assert_matches!(
+        initial().complete_task(&completion(vec![
+            command::Attributes::ScheduleActivityTaskCommandAttributes(
+                ScheduleActivityTaskCommandAttributes::default()
+            )
+        ])),
+        Err(ModelError::InvalidCommand(
+            CommandType::ScheduleActivityTask
+        ))
+    );
+}
+
+#[tokio::test]
+async fn generated_remote_activity_result_replays_through_core() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let expected = payloads("sampled result");
+        let model = initial()
+            .complete_task(&completion(vec![activity("remote")]))
+            .unwrap()
+            .extend(&[ModelEvent::CompleteActivity {
+                scheduled_event_id: 5,
+                result: expected.clone(),
+            }])
+            .unwrap();
+        let (feeder, histories) = HistoryFeeder::new(1);
+        feeder
+            .feed(HistoryForReplay::new(model.history, "model-workflow"))
+            .await
+            .unwrap();
+        let worker = init_replay_worker(ReplayWorkerInput::new(
+            test_worker_cfg().build().unwrap(),
+            histories,
+        ))
+        .unwrap();
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                activation.run_id,
+                workflow_commands::ScheduleActivity {
+                    seq: 1,
+                    activity_id: "remote".to_owned(),
+                    activity_type: "model-activity".to_owned(),
+                    task_queue: "model-queue".to_owned(),
+                    start_to_close_timeout: Some(Duration::from_secs(10).try_into().unwrap()),
+                    ..Default::default()
+                }
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs[0].variant.as_ref(),
+            Some(workflow_activation_job::Variant::ResolveActivity(a))
+                if matches!(
+                    a.result.as_ref().unwrap().status.as_ref().unwrap(),
+                    activity_resolution::Status::Completed(c)
+                        if c.result.as_ref() == expected.payloads.first()
+                )
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                activation.run_id,
+                workflow_commands::CompleteWorkflowExecution::default().into(),
+            ))
+            .await
+            .unwrap();
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs[0].variant,
+            Some(workflow_activation_job::Variant::RemoveFromCache(_))
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+        drop(feeder);
+        worker.shutdown().await;
+        worker.finalize_shutdown().await;
+    })
+    .await
+    .expect("generated activity history replay did not finish");
 }
 
 #[tokio::test]
