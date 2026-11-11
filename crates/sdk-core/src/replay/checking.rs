@@ -34,6 +34,17 @@ pub struct CheckLimits {
     pub task_timeout: Duration,
 }
 
+/// External inputs eligible during exploration.
+#[derive(Debug, Default)]
+pub struct CheckInputs {
+    /// Each configured signal remains eligible at every open frontier.
+    pub signals: Vec<WorkflowExecutionSignaledEventAttributes>,
+    /// Outcomes shared by invocations of each remote activity type.
+    pub activity_samples: BTreeMap<String, ActivitySamples>,
+    /// Explore one external workflow cancellation request per branch.
+    pub workflow_cancellation: bool,
+}
+
 /// The input history of the first failed or timed-out task and its failure.
 #[derive(Debug)]
 pub struct Counterexample {
@@ -102,8 +113,7 @@ impl WorkflowCheck {
         &mut self,
         workflow_id: &str,
         initial: ModelHistory,
-        signals: &[WorkflowExecutionSignaledEventAttributes],
-        activity_samples: &BTreeMap<String, ActivitySamples>,
+        inputs: &CheckInputs,
         limits: CheckLimits,
     ) -> Result<Option<Counterexample>, CheckError> {
         if limits.max_checks == 0 || limits.timeout.is_zero() || limits.task_timeout.is_zero() {
@@ -163,8 +173,12 @@ impl WorkflowCheck {
             let choices = settled
                 .timer_choices()
                 .into_iter()
-                .chain(settled.activity_choices(activity_samples)?)
-                .chain(signals.iter().cloned().map(ModelEvent::Signal))
+                .chain(settled.activity_choices(&inputs.activity_samples)?)
+                .chain(
+                    (inputs.workflow_cancellation && !settled.workflow_cancellation_requested())
+                        .then_some(ModelEvent::CancelWorkflow),
+                )
+                .chain(inputs.signals.iter().cloned().map(ModelEvent::Signal))
                 .collect::<Vec<_>>();
             for choice in choices.into_iter().rev() {
                 stack.push((settled.extend(&[choice])?, depth + 1));

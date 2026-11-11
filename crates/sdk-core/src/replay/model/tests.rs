@@ -17,9 +17,10 @@ use temporalio_common::protos::{
     },
     temporal::api::{
         command::v1::{
-            CancelTimerCommandAttributes, Command, CompleteWorkflowExecutionCommandAttributes,
-            FailWorkflowExecutionCommandAttributes, ModifyWorkflowPropertiesCommandAttributes,
-            RecordMarkerCommandAttributes, ScheduleActivityTaskCommandAttributes,
+            CancelTimerCommandAttributes, CancelWorkflowExecutionCommandAttributes, Command,
+            CompleteWorkflowExecutionCommandAttributes, FailWorkflowExecutionCommandAttributes,
+            ModifyWorkflowPropertiesCommandAttributes, RecordMarkerCommandAttributes,
+            RequestCancelActivityTaskCommandAttributes, ScheduleActivityTaskCommandAttributes,
             StartTimerCommandAttributes, UpsertWorkflowSearchAttributesCommandAttributes,
         },
         common::v1::{ActivityType, Memo, Payload, Payloads, RetryPolicy, SearchAttributes},
@@ -112,6 +113,246 @@ fn payloads(value: &str) -> Payloads {
             ..Default::default()
         }],
     }
+}
+
+fn cancel_activity(scheduled_event_id: i64) -> command::Attributes {
+    command::Attributes::RequestCancelActivityTaskCommandAttributes(
+        RequestCancelActivityTaskCommandAttributes { scheduled_event_id },
+    )
+}
+
+#[test]
+fn activity_cancellation_keeps_completion_eligible_until_acknowledged() {
+    let root = initial()
+        .complete_task(&completion(vec![
+            activity("remote"),
+            timer("deadline", Duration::from_secs(5)),
+        ]))
+        .unwrap();
+    let samples = BTreeMap::from([(
+        "model-activity".to_owned(),
+        ActivitySamples {
+            results: vec![payloads("completed")],
+            failures: vec![Failure {
+                failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        non_retryable: true,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }],
+        },
+    )]);
+    assert_matches!(
+        root.extend(&[ModelEvent::CancelActivity {
+            scheduled_event_id: 5,
+            started: false
+        }]),
+        Err(ModelError::ActivityCancellationNotRequested(5))
+    );
+    let requested = root
+        .extend(&[signal("cancel")])
+        .unwrap()
+        .complete_task(&completion(vec![cancel_activity(5)]))
+        .unwrap();
+    let request = requested.history.events.last().unwrap();
+    assert_matches!(
+        request.attributes.as_ref(),
+        Some(history_event::Attributes::ActivityTaskCancelRequestedEventAttributes(a))
+            if a.scheduled_event_id == 5 && a.workflow_task_completed_event_id == request.event_id - 1
+    );
+    let choices = requested.activity_choices(&samples).unwrap();
+    assert_eq!(choices.len(), 4);
+    assert_eq!(requested.timer_choices(), root.timer_choices());
+    for choice in &choices {
+        let branch = requested.extend(std::slice::from_ref(choice)).unwrap();
+        if let ModelEvent::CancelActivity { started, .. } = choice {
+            let canceled = branch
+                .history
+                .events
+                .iter()
+                .find_map(|event| {
+                    if let Some(history_event::Attributes::ActivityTaskCanceledEventAttributes(a)) =
+                        &event.attributes
+                    {
+                        Some(a)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(canceled.latest_cancel_requested_event_id, request.event_id);
+            assert_eq!(canceled.scheduled_event_id, 5);
+            assert_eq!(canceled.started_event_id != 0, *started);
+        }
+        let settled = branch.complete_task(&completion(vec![])).unwrap();
+        assert!(
+            settled
+                .activity_choices(&BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_matches!(
+            settled.extend(std::slice::from_ref(choice)),
+            Err(ModelError::ActivityNotPending(5))
+        );
+        let reused = settled
+            .extend(&[signal("reuse")])
+            .unwrap()
+            .complete_task(&completion(vec![activity("remote")]))
+            .unwrap();
+        assert_eq!(reused.activity_choices(&samples).unwrap().len(), 2);
+    }
+    assert_eq!(root.activity_choices(&samples).unwrap().len(), 2);
+    assert_matches!(
+        requested
+            .extend(&[signal("cancel-again")])
+            .unwrap()
+            .complete_task(&completion(vec![cancel_activity(5)])),
+        Err(ModelError::ActivityCancellationAlreadyRequested(5))
+    );
+    assert_matches!(
+        root.extend(&[signal("unknown")])
+            .unwrap()
+            .complete_task(&completion(vec![cancel_activity(999)])),
+        Err(ModelError::ActivityNotPending(999))
+    );
+}
+
+#[test]
+fn workflow_cancellation_is_requested_once_and_can_close_the_execution() {
+    let root = initial().complete_task(&completion(vec![])).unwrap();
+    let requested = root.extend(&[ModelEvent::CancelWorkflow]).unwrap();
+    assert!(requested.workflow_cancellation_requested());
+    assert!(!root.workflow_cancellation_requested());
+    let settled = requested.complete_task(&completion(vec![])).unwrap();
+    assert_matches!(
+        settled.extend(&[ModelEvent::CancelWorkflow]),
+        Err(ModelError::WorkflowCancellationAlreadyRequested)
+    );
+    let closed = settled
+        .extend(&[signal("finish-cleanup")])
+        .unwrap()
+        .complete_task(&completion(vec![
+            command::Attributes::CancelWorkflowExecutionCommandAttributes(
+                CancelWorkflowExecutionCommandAttributes {
+                    details: Some(payloads("cleanup finished")),
+                },
+            ),
+        ]))
+        .unwrap();
+    assert!(closed.is_closed());
+    let last = closed.history.events.last().unwrap();
+    assert_matches!(
+        last.attributes.as_ref(),
+        Some(history_event::Attributes::WorkflowExecutionCanceledEventAttributes(a))
+            if a.workflow_task_completed_event_id == last.event_id - 1
+                && a.details == Some(payloads("cleanup finished"))
+    );
+    assert_matches!(
+        closed.extend(&[signal("late")]),
+        Err(ModelError::WorkflowClosed)
+    );
+}
+
+#[tokio::test]
+async fn generated_activity_cancellations_replay_through_core() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for started in [false, true] {
+            let model = initial()
+                .complete_task(&completion(vec![activity("remote")]))
+                .unwrap()
+                .extend(&[signal("cancel")])
+                .unwrap()
+                .complete_task(&completion(vec![cancel_activity(5)]))
+                .unwrap()
+                .extend(&[ModelEvent::CancelActivity {
+                    scheduled_event_id: 5,
+                    started,
+                }])
+                .unwrap()
+                .complete_task(&completion(vec![
+                    command::Attributes::CompleteWorkflowExecutionCommandAttributes(
+                        CompleteWorkflowExecutionCommandAttributes::default(),
+                    ),
+                ]))
+                .unwrap();
+            let (feeder, histories) = HistoryFeeder::new(1);
+            feeder
+                .feed(HistoryForReplay::new(model.history, "model-workflow"))
+                .await
+                .unwrap();
+            let worker = init_replay_worker(ReplayWorkerInput::new(
+                test_worker_cfg().build().unwrap(),
+                histories,
+            ))
+            .unwrap();
+            let activation = worker.poll_workflow_activation().await.unwrap();
+            worker
+                .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                    activation.run_id,
+                    workflow_commands::ScheduleActivity {
+                        seq: 1,
+                        activity_id: "remote".to_owned(),
+                        activity_type: "model-activity".to_owned(),
+                        task_queue: "model-queue".to_owned(),
+                        start_to_close_timeout: Some(Duration::from_secs(10).try_into().unwrap()),
+                        cancellation_type:
+                            workflow_commands::ActivityCancellationType::WaitCancellationCompleted
+                                as i32,
+                        ..Default::default()
+                    }
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let activation = worker.poll_workflow_activation().await.unwrap();
+            assert_matches!(
+                activation.jobs[0].variant.as_ref(),
+                Some(workflow_activation_job::Variant::SignalWorkflow(_))
+            );
+            worker
+                .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                    activation.run_id,
+                    workflow_commands::RequestCancelActivity { seq: 1 }.into(),
+                ))
+                .await
+                .unwrap();
+            let activation = worker.poll_workflow_activation().await.unwrap();
+            assert_matches!(
+                activation.jobs[0].variant.as_ref(),
+                Some(workflow_activation_job::Variant::ResolveActivity(a))
+                    if matches!(
+                        a.result.as_ref().unwrap().status.as_ref().unwrap(),
+                        activity_resolution::Status::Cancelled(_)
+                    )
+            );
+            worker
+                .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                    activation.run_id,
+                    workflow_commands::CompleteWorkflowExecution::default().into(),
+                ))
+                .await
+                .unwrap();
+            let activation = worker.poll_workflow_activation().await.unwrap();
+            assert_matches!(
+                activation.jobs[0].variant.as_ref(),
+                Some(workflow_activation_job::Variant::RemoveFromCache(_))
+            );
+            worker
+                .complete_workflow_activation(WorkflowActivationCompletion::empty(
+                    activation.run_id,
+                ))
+                .await
+                .unwrap();
+            drop(feeder);
+            worker.shutdown().await;
+            worker.finalize_shutdown().await;
+        }
+    })
+    .await
+    .expect("generated cancellation history replay did not finish");
 }
 
 #[test]

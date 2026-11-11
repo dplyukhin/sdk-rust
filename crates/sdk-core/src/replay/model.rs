@@ -2,8 +2,9 @@
 //!
 //! Transitions return new histories so callers can backtrack without restoring cached execution
 //! state. Search attribute and memo updates and patch markers are recorded without adding choices.
-//! Terminal activity failures and start-to-close timeouts are supported. Activity retries,
-//! cancellation, local activities, updates, execution retries, and workflow-task retries are not modeled.
+//! Terminal activity failures, start-to-close timeouts, and activity and workflow cancellation are
+//! supported. Activity retries, local activities, updates, execution retries, and workflow-task
+//! retries are not modeled.
 
 use crate::WorkflowTaskCompletion;
 use prost::Message;
@@ -18,16 +19,18 @@ use temporalio_common::protos::{
         enums::v1::{CommandType, EventType, RetryState, TimeoutType, VersioningBehavior},
         failure::v1::{Failure, failure},
         history::v1::{
+            ActivityTaskCancelRequestedEventAttributes, ActivityTaskCanceledEventAttributes,
             ActivityTaskCompletedEventAttributes, ActivityTaskFailedEventAttributes,
             ActivityTaskScheduledEventAttributes, ActivityTaskStartedEventAttributes,
             ActivityTaskTimedOutEventAttributes, History, HistoryEvent,
             MarkerRecordedEventAttributes, TimerCanceledEventAttributes, TimerFiredEventAttributes,
             TimerStartedEventAttributes, UpsertWorkflowSearchAttributesEventAttributes,
-            WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
-            WorkflowExecutionSignaledEventAttributes, WorkflowExecutionStartedEventAttributes,
-            WorkflowPropertiesModifiedEventAttributes, WorkflowTaskCompletedEventAttributes,
-            WorkflowTaskScheduledEventAttributes, WorkflowTaskStartedEventAttributes,
-            history_event,
+            WorkflowExecutionCancelRequestedEventAttributes,
+            WorkflowExecutionCanceledEventAttributes, WorkflowExecutionCompletedEventAttributes,
+            WorkflowExecutionFailedEventAttributes, WorkflowExecutionSignaledEventAttributes,
+            WorkflowExecutionStartedEventAttributes, WorkflowPropertiesModifiedEventAttributes,
+            WorkflowTaskCompletedEventAttributes, WorkflowTaskScheduledEventAttributes,
+            WorkflowTaskStartedEventAttributes, history_event,
         },
     },
 };
@@ -56,6 +59,15 @@ pub enum ModelEvent {
         /// Failure payloads are recorded once and reused during replay.
         failure: Failure,
     },
+    /// Acknowledge a previously requested activity cancellation.
+    CancelActivity {
+        /// The schedule event identifies the unresolved invocation.
+        scheduled_event_id: i64,
+        /// Queued activities can acknowledge without an activity-start event.
+        started: bool,
+    },
+    /// Request cancellation once while the workflow is open.
+    CancelWorkflow,
 }
 
 /// Concrete outcomes shared by all invocations of an activity type.
@@ -121,6 +133,15 @@ pub enum ModelError {
     /// A sampled failure would require behavior outside the single-attempt model.
     #[error("unsupported activity failure: {0}")]
     UnsupportedActivityFailure(&'static str),
+    /// An acknowledgement cannot precede its cancellation request.
+    #[error("cancellation has not been requested for activity scheduled at event {0}")]
+    ActivityCancellationNotRequested(i64),
+    /// A second cancellation command would not produce another request event.
+    #[error("cancellation has already been requested for activity scheduled at event {0}")]
+    ActivityCancellationAlreadyRequested(i64),
+    /// Repeated external cancellation requests do not create additional history events.
+    #[error("workflow cancellation has already been requested")]
+    WorkflowCancellationAlreadyRequested,
     /// An unnamed signal cannot be dispatched to a handler.
     #[error("a signal must have a name")]
     EmptySignalName,
@@ -197,6 +218,16 @@ impl ModelHistory {
             .is_final_wf_execution_event()
     }
 
+    /// Whether the execution has already received an external cancellation request.
+    pub fn workflow_cancellation_requested(&self) -> bool {
+        self.history.events.iter().any(|event| {
+            matches!(
+                event.attributes,
+                Some(history_event::Attributes::WorkflowExecutionCancelRequestedEventAttributes(_))
+            )
+        })
+    }
+
     /// Pending timer choices in stable timer-ID order, available only between tasks.
     ///
     /// Signal choices come from the caller's input generator rather than from history.
@@ -219,6 +250,7 @@ impl ModelHistory {
             return Ok(vec![]);
         }
         let mut choices = vec![];
+        let cancellations = self.activity_cancel_requests();
         for (scheduled_event_id, activity) in self.pending_activities() {
             let name = &activity.activity_type.as_ref().unwrap().name;
             let samples = samples
@@ -237,6 +269,12 @@ impl ModelHistory {
                     failure,
                 }
             }));
+            if cancellations.contains_key(&scheduled_event_id) {
+                choices.extend([false, true].map(|started| ModelEvent::CancelActivity {
+                    scheduled_event_id,
+                    started,
+                }));
+            }
         }
         Ok(choices)
     }
@@ -345,6 +383,27 @@ impl ModelHistory {
                     }
                     .into()
                 }
+                command::Attributes::RequestCancelActivityTaskCommandAttributes(a) => {
+                    if !next
+                        .pending_activities()
+                        .contains_key(&a.scheduled_event_id)
+                    {
+                        return Err(ModelError::ActivityNotPending(a.scheduled_event_id));
+                    }
+                    if next
+                        .activity_cancel_requests()
+                        .contains_key(&a.scheduled_event_id)
+                    {
+                        return Err(ModelError::ActivityCancellationAlreadyRequested(
+                            a.scheduled_event_id,
+                        ));
+                    }
+                    ActivityTaskCancelRequestedEventAttributes {
+                        scheduled_event_id: a.scheduled_event_id,
+                        workflow_task_completed_event_id: completed_id,
+                    }
+                    .into()
+                }
                 command::Attributes::UpsertWorkflowSearchAttributesCommandAttributes(a) => {
                     UpsertWorkflowSearchAttributesEventAttributes {
                         workflow_task_completed_event_id: completed_id,
@@ -371,6 +430,13 @@ impl ModelHistory {
                         workflow_task_completed_event_id: completed_id,
                         header: a.header.clone(),
                         failure: a.failure.clone(),
+                    }
+                    .into()
+                }
+                command::Attributes::CancelWorkflowExecutionCommandAttributes(a) => {
+                    WorkflowExecutionCanceledEventAttributes {
+                        workflow_task_completed_event_id: completed_id,
+                        details: a.details.clone(),
                     }
                     .into()
                 }
@@ -451,6 +517,52 @@ impl ModelHistory {
                         return Err(ModelError::EmptySignalName);
                     }
                     next.push(attrs.clone().into(), next.time());
+                }
+                ModelEvent::CancelWorkflow => {
+                    if next.workflow_cancellation_requested() {
+                        return Err(ModelError::WorkflowCancellationAlreadyRequested);
+                    }
+                    next.push(
+                        WorkflowExecutionCancelRequestedEventAttributes::default().into(),
+                        next.time(),
+                    );
+                }
+                ModelEvent::CancelActivity {
+                    scheduled_event_id,
+                    started,
+                } => {
+                    if !next.pending_activities().contains_key(scheduled_event_id) {
+                        return Err(ModelError::ActivityNotPending(*scheduled_event_id));
+                    }
+                    let request_id = *next
+                        .activity_cancel_requests()
+                        .get(scheduled_event_id)
+                        .ok_or(ModelError::ActivityCancellationNotRequested(
+                            *scheduled_event_id,
+                        ))?;
+                    let started_event_id = if *started {
+                        next.push(
+                            ActivityTaskStartedEventAttributes {
+                                scheduled_event_id: *scheduled_event_id,
+                                attempt: 1,
+                                ..Default::default()
+                            }
+                            .into(),
+                            next.time(),
+                        )
+                    } else {
+                        0
+                    };
+                    next.push(
+                        ActivityTaskCanceledEventAttributes {
+                            scheduled_event_id: *scheduled_event_id,
+                            started_event_id,
+                            latest_cancel_requested_event_id: request_id,
+                            ..Default::default()
+                        }
+                        .into(),
+                        next.time(),
+                    );
                 }
                 event @ (ModelEvent::CompleteActivity {
                     scheduled_event_id, ..
@@ -591,10 +703,26 @@ impl ModelHistory {
                 Some(history_event::Attributes::ActivityTaskTimedOutEventAttributes(a)) => {
                     activities.remove(&a.scheduled_event_id);
                 }
+                Some(history_event::Attributes::ActivityTaskCanceledEventAttributes(a)) => {
+                    activities.remove(&a.scheduled_event_id);
+                }
                 _ => {}
             }
         }
         activities
+    }
+
+    fn activity_cancel_requests(&self) -> BTreeMap<i64, i64> {
+        self.history
+            .events
+            .iter()
+            .filter_map(|event| match event.attributes.as_ref() {
+                Some(history_event::Attributes::ActivityTaskCancelRequestedEventAttributes(a)) => {
+                    Some((a.scheduled_event_id, event.event_id))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn task_pending(&self) -> bool {
