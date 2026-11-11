@@ -4,6 +4,12 @@
 
 mod history_info;
 
+/// Bounded exploration using the normal Core replay worker.
+pub mod checking;
+
+/// Experimental history transitions for bounded workflow checking.
+pub mod model;
+
 /// Pre-built test histories for common workflow patterns.
 #[cfg(any(feature = "test-utilities", test))]
 pub mod canned_histories;
@@ -59,6 +65,7 @@ pub struct ReplayWorkerInput<I> {
     history_stream: I,
     /// If specified use this as the basis for the internal mocked client
     pub(crate) client_override: Option<MockManualWorkerClient>,
+    pub(crate) task_results: Option<mpsc::UnboundedSender<checking::TaskResult>>,
 }
 
 impl<I> ReplayWorkerInput<I>
@@ -71,6 +78,7 @@ where
             config,
             history_stream,
             client_override: None,
+            task_results: None,
         }
     }
 
@@ -129,14 +137,28 @@ where
             .boxed()
         });
 
+        let results = self.task_results.clone();
         client
             .expect_complete_workflow_task()
-            .returning(move |_a, _b| {
+            .returning(move |completion, _| {
+                if let Some(results) = &results {
+                    let _ = results.send(checking::TaskResult::Completed(completion));
+                }
                 async move { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed()
             });
+        let results = self.task_results;
         client
             .expect_fail_workflow_task()
-            .returning(move |_, _, _| {
+            .returning(move |_, cause, failure| {
+                if let Some(results) = &results {
+                    let _ =
+                        results.send(checking::TaskResult::Failed(failure.unwrap_or_else(|| {
+                            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                                message: format!("Workflow task failed: {cause:?}"),
+                                ..Default::default()
+                            }
+                        })));
+                }
                 hist_allow_tx.send("Failed".to_string()).unwrap();
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });

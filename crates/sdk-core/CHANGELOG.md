@@ -33,6 +33,9 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Language SDKs can offer experimental, serverless exploration of timer and signal schedules, returning the history and failure of the first failed or timed-out workflow task.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
