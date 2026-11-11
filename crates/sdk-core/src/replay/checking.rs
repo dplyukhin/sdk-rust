@@ -116,6 +116,24 @@ impl WorkflowCheck {
         inputs: &CheckInputs,
         limits: CheckLimits,
     ) -> Result<Option<Counterexample>, CheckError> {
+        self.run_with_history_callback(workflow_id, initial, inputs, limits, |_| {})
+            .await
+    }
+
+    /// Explore while reporting each submitted frontier and each committed task completion.
+    ///
+    /// Completed histories retain command consequences, including terminal events, so replay can
+    /// compare the last completed task rather than only the tasks preceding a frontier. Queued
+    /// frontiers that are never evaluated because of a bound or counterexample are not reported.
+    /// Histories reported before a model error remain available to the caller.
+    pub async fn run_with_history_callback(
+        &mut self,
+        workflow_id: &str,
+        initial: ModelHistory,
+        inputs: &CheckInputs,
+        limits: CheckLimits,
+        mut on_history: impl FnMut(&History) + Send,
+    ) -> Result<Option<Counterexample>, CheckError> {
         if limits.max_checks == 0 || limits.timeout.is_zero() || limits.task_timeout.is_zero() {
             return Err(CheckError::InvalidLimits);
         }
@@ -125,6 +143,7 @@ impl WorkflowCheck {
             let Some((history, depth)) = stack.pop() else {
                 break;
             };
+            on_history(history.history());
             self.feeder
                 .feed(HistoryForReplay::new(
                     history.history().clone(),
@@ -167,6 +186,7 @@ impl WorkflowCheck {
                 _ = self.evicted.notified() => {}
             }
             let settled = history.complete_task(&completion)?;
+            on_history(settled.history());
             if settled.is_closed() || depth == limits.max_depth {
                 continue;
             }
@@ -185,5 +205,124 @@ impl WorkflowCheck {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::default_wes_attribs;
+    use temporalio_common::protos::temporal::api::{
+        command::v1::{
+            Command, CommandAttributesExt, CompleteWorkflowExecutionCommandAttributes,
+            ContinueAsNewWorkflowExecutionCommandAttributes, StartTimerCommandAttributes, command,
+        },
+        enums::v1::VersioningBehavior,
+        history::v1::history_event,
+    };
+
+    #[tokio::test]
+    async fn reports_frontiers_and_committed_histories_at_bounds_and_on_errors() {
+        for mode in ["terminal", "depth_bound", "model_error", "task_failure"] {
+            let (feeder, _histories) = HistoryFeeder::new(1);
+            let (tx, results) = mpsc::unbounded_channel();
+            let evicted = Arc::new(Notify::new());
+            let mut checker = WorkflowCheck {
+                feeder,
+                results,
+                evicted: evicted.clone(),
+            };
+            let initial = ModelHistory::new(
+                default_wes_attribs(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            )
+            .unwrap();
+            let attributes = match mode {
+                "depth_bound" => {
+                    command::Attributes::StartTimerCommandAttributes(StartTimerCommandAttributes {
+                        timer_id: "timer".to_owned(),
+                        start_to_fire_timeout: Some(Duration::from_secs(1).try_into().unwrap()),
+                    })
+                }
+                "model_error" => {
+                    command::Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
+                        ContinueAsNewWorkflowExecutionCommandAttributes::default(),
+                    )
+                }
+                _ => command::Attributes::CompleteWorkflowExecutionCommandAttributes(
+                    CompleteWorkflowExecutionCommandAttributes::default(),
+                ),
+            };
+            let completion = WorkflowTaskCompletion {
+                task_token: vec![].into(),
+                commands: vec![Command {
+                    command_type: attributes.as_type() as i32,
+                    attributes: Some(attributes),
+                    ..Default::default()
+                }],
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: false,
+                wft_completion_size_limit: None,
+            };
+            tx.send(if mode == "task_failure" {
+                TaskResult::Failed(Failure::default())
+            } else {
+                TaskResult::Completed(completion)
+            })
+            .unwrap();
+            evicted.notify_one();
+            let mut observed = vec![];
+            let result = checker
+                .run_with_history_callback(
+                    "test",
+                    initial,
+                    &CheckInputs::default(),
+                    CheckLimits {
+                        max_depth: 0,
+                        max_checks: 1,
+                        timeout: Duration::from_secs(5),
+                        task_timeout: Duration::from_secs(5),
+                    },
+                    |history| observed.push(history.clone()),
+                )
+                .await;
+            assert!(matches!(
+                observed[0].events.last().unwrap().attributes,
+                Some(history_event::Attributes::WorkflowTaskStartedEventAttributes(_))
+            ));
+            match mode {
+                "task_failure" => {
+                    assert!(result.unwrap().is_some());
+                    assert_eq!(observed.len(), 1);
+                }
+                "model_error" => {
+                    assert!(matches!(result, Err(CheckError::Model(_))));
+                    assert_eq!(observed.len(), 1);
+                }
+                _ => {
+                    assert!(result.unwrap().is_none());
+                    assert_eq!(observed.len(), 2);
+                    let last = observed[1].events.last().unwrap().attributes.as_ref();
+                    assert!(if mode == "terminal" {
+                        matches!(
+                            last,
+                            Some(history_event::Attributes::WorkflowExecutionCompletedEventAttributes(_))
+                        )
+                    } else {
+                        matches!(
+                            last,
+                            Some(history_event::Attributes::TimerStartedEventAttributes(_))
+                        )
+                    });
+                }
+            }
+        }
     }
 }
