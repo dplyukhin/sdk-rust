@@ -2,8 +2,8 @@
 //!
 //! Transitions return new histories so callers can backtrack without restoring cached execution
 //! state. Search attribute and memo updates and patch markers are recorded without adding choices.
-//! Activity failures, timeouts, retries, cancellation, local activities, updates, execution retries,
-//! and workflow-task retries are not modeled.
+//! Terminal activity failures and start-to-close timeouts are supported. Activity retries,
+//! cancellation, local activities, updates, execution retries, and workflow-task retries are not modeled.
 
 use crate::WorkflowTaskCompletion;
 use prost::Message;
@@ -15,10 +15,12 @@ use temporalio_common::protos::{
     temporal::api::{
         command::v1::{CommandAttributesExt, command},
         common::v1::Payloads,
-        enums::v1::{CommandType, EventType, RetryState, VersioningBehavior},
+        enums::v1::{CommandType, EventType, RetryState, TimeoutType, VersioningBehavior},
+        failure::v1::{Failure, failure},
         history::v1::{
-            ActivityTaskCompletedEventAttributes, ActivityTaskScheduledEventAttributes,
-            ActivityTaskStartedEventAttributes, History, HistoryEvent,
+            ActivityTaskCompletedEventAttributes, ActivityTaskFailedEventAttributes,
+            ActivityTaskScheduledEventAttributes, ActivityTaskStartedEventAttributes,
+            ActivityTaskTimedOutEventAttributes, History, HistoryEvent,
             MarkerRecordedEventAttributes, TimerCanceledEventAttributes, TimerFiredEventAttributes,
             TimerStartedEventAttributes, UpsertWorkflowSearchAttributesEventAttributes,
             WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
@@ -47,6 +49,22 @@ pub enum ModelEvent {
         /// Payloads to record in history and reuse during replay.
         result: Payloads,
     },
+    /// Resolve an activity with a terminal application failure or start-to-close timeout.
+    FailActivity {
+        /// The schedule event identifies the unresolved invocation.
+        scheduled_event_id: i64,
+        /// Failure payloads are recorded once and reused during replay.
+        failure: Failure,
+    },
+}
+
+/// Concrete outcomes shared by all invocations of an activity type.
+#[derive(Clone, Debug, Default)]
+pub struct ActivitySamples {
+    /// Successful return payloads.
+    pub results: Vec<Payloads>,
+    /// Application failures and start-to-close timeouts.
+    pub failures: Vec<Failure>,
 }
 
 /// A branch whose only execution state is its history.
@@ -98,8 +116,11 @@ pub enum ModelError {
     #[error("activity scheduled at event {0} is not pending")]
     ActivityNotPending(i64),
     /// Missing samples must not silently leave an activity unresolved.
-    #[error("no sampled results for activity type {0:?}")]
+    #[error("no sampled results or failures for activity type {0:?}")]
     MissingActivityResults(String),
+    /// A sampled failure would require behavior outside the single-attempt model.
+    #[error("unsupported activity failure: {0}")]
+    UnsupportedActivityFailure(&'static str),
     /// An unnamed signal cannot be dispatched to a handler.
     #[error("a signal must have a name")]
     EmptySignalName,
@@ -189,10 +210,10 @@ impl ModelHistory {
             .collect()
     }
 
-    /// Pending remote activity resolutions in schedule order, using the caller's sampled payloads.
+    /// Pending remote activity resolutions in schedule order, using the caller's sampled outcomes.
     pub fn activity_choices(
         &self,
-        results: &BTreeMap<String, Vec<Payloads>>,
+        samples: &BTreeMap<String, ActivitySamples>,
     ) -> Result<Vec<ModelEvent>, ModelError> {
         if self.is_closed() || self.task_pending() {
             return Ok(vec![]);
@@ -200,19 +221,22 @@ impl ModelHistory {
         let mut choices = vec![];
         for (scheduled_event_id, activity) in self.pending_activities() {
             let name = &activity.activity_type.as_ref().unwrap().name;
-            let samples = results
+            let samples = samples
                 .get(name)
-                .filter(|samples| !samples.is_empty())
+                .filter(|samples| !samples.results.is_empty() || !samples.failures.is_empty())
                 .ok_or_else(|| ModelError::MissingActivityResults(name.clone()))?;
-            choices.extend(
-                samples
-                    .iter()
-                    .cloned()
-                    .map(|result| ModelEvent::CompleteActivity {
-                        scheduled_event_id,
-                        result,
-                    }),
-            );
+            choices.extend(samples.results.iter().cloned().map(|result| {
+                ModelEvent::CompleteActivity {
+                    scheduled_event_id,
+                    result,
+                }
+            }));
+            choices.extend(samples.failures.iter().cloned().map(|failure| {
+                ModelEvent::FailActivity {
+                    scheduled_event_id,
+                    failure,
+                }
+            }));
         }
         Ok(choices)
     }
@@ -428,12 +452,54 @@ impl ModelHistory {
                     }
                     next.push(attrs.clone().into(), next.time());
                 }
-                ModelEvent::CompleteActivity {
-                    scheduled_event_id,
-                    result,
-                } => {
-                    if !next.pending_activities().contains_key(scheduled_event_id) {
-                        return Err(ModelError::ActivityNotPending(*scheduled_event_id));
+                event @ (ModelEvent::CompleteActivity {
+                    scheduled_event_id, ..
+                }
+                | ModelEvent::FailActivity {
+                    scheduled_event_id, ..
+                }) => {
+                    let pending = next.pending_activities();
+                    let activity = pending
+                        .get(scheduled_event_id)
+                        .ok_or(ModelError::ActivityNotPending(*scheduled_event_id))?;
+                    let mut time = next.time();
+                    let mut retry_state = RetryState::Unspecified;
+                    if let ModelEvent::FailActivity { failure, .. } = event {
+                        let non_retryable = match failure.failure_info.as_ref() {
+                            Some(failure::FailureInfo::ApplicationFailureInfo(info)) => {
+                                info.non_retryable
+                                    || activity.retry_policy.as_ref().is_some_and(|p| {
+                                        p.non_retryable_error_types.contains(&info.r#type)
+                                    })
+                            }
+                            Some(failure::FailureInfo::TimeoutFailureInfo(info))
+                                if info.timeout_type == TimeoutType::StartToClose as i32 =>
+                            {
+                                time = timeout_deadline(time, activity.start_to_close_timeout)
+                                    .ok_or(ModelError::UnsupportedActivityFailure(
+                                        "start-to-close timeouts require a positive, representable timeout",
+                                    ))?;
+                                false
+                            }
+                            _ => {
+                                return Err(ModelError::UnsupportedActivityFailure(
+                                    "only application failures and start-to-close timeouts are modeled",
+                                ));
+                            }
+                        };
+                        retry_state = if non_retryable {
+                            RetryState::NonRetryableFailure
+                        } else if activity
+                            .retry_policy
+                            .as_ref()
+                            .is_some_and(|p| p.maximum_attempts == 1)
+                        {
+                            RetryState::MaximumAttemptsReached
+                        } else {
+                            return Err(ModelError::UnsupportedActivityFailure(
+                                "retryable failures and timeouts require maximum_attempts = 1",
+                            ));
+                        };
                     }
                     let started_event_id = next.push(
                         ActivityTaskStartedEventAttributes {
@@ -444,16 +510,42 @@ impl ModelHistory {
                         .into(),
                         next.time(),
                     );
-                    next.push(
-                        ActivityTaskCompletedEventAttributes {
-                            scheduled_event_id: *scheduled_event_id,
-                            started_event_id,
-                            result: Some(result.clone()),
-                            ..Default::default()
+                    let attributes = match event {
+                        ModelEvent::CompleteActivity { result, .. } => {
+                            ActivityTaskCompletedEventAttributes {
+                                scheduled_event_id: *scheduled_event_id,
+                                started_event_id,
+                                result: Some(result.clone()),
+                                ..Default::default()
+                            }
+                            .into()
                         }
-                        .into(),
-                        next.time(),
-                    );
+                        ModelEvent::FailActivity { failure, .. } => {
+                            if matches!(
+                                failure.failure_info,
+                                Some(failure::FailureInfo::TimeoutFailureInfo(_))
+                            ) {
+                                ActivityTaskTimedOutEventAttributes {
+                                    scheduled_event_id: *scheduled_event_id,
+                                    started_event_id,
+                                    failure: Some(failure.clone()),
+                                    retry_state: retry_state as i32,
+                                }
+                                .into()
+                            } else {
+                                ActivityTaskFailedEventAttributes {
+                                    scheduled_event_id: *scheduled_event_id,
+                                    started_event_id,
+                                    failure: Some(failure.clone()),
+                                    retry_state: retry_state as i32,
+                                    ..Default::default()
+                                }
+                                .into()
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    next.push(attributes, time);
                 }
             }
             if scheduled == 0 {
@@ -491,6 +583,12 @@ impl ModelHistory {
                     activities.insert(event.event_id, a);
                 }
                 Some(history_event::Attributes::ActivityTaskCompletedEventAttributes(a)) => {
+                    activities.remove(&a.scheduled_event_id);
+                }
+                Some(history_event::Attributes::ActivityTaskFailedEventAttributes(a)) => {
+                    activities.remove(&a.scheduled_event_id);
+                }
+                Some(history_event::Attributes::ActivityTaskTimedOutEventAttributes(a)) => {
                     activities.remove(&a.scheduled_event_id);
                 }
                 _ => {}
@@ -554,22 +652,25 @@ fn timer_deadline(
     timeout: Option<prost_types::Duration>,
     timer_id: &str,
 ) -> Result<Timestamp, ModelError> {
-    let invalid = || ModelError::InvalidTimerTimeout(timer_id.to_owned());
-    let timeout = timeout.ok_or_else(invalid)?;
+    timeout_deadline(start, timeout)
+        .ok_or_else(|| ModelError::InvalidTimerTimeout(timer_id.to_owned()))
+}
+
+fn timeout_deadline(start: Timestamp, timeout: Option<prost_types::Duration>) -> Option<Timestamp> {
+    let timeout = timeout?;
     if timeout.seconds < 0
         || !(0..1_000_000_000).contains(&timeout.nanos)
         || (timeout.seconds == 0 && timeout.nanos == 0)
     {
-        return Err(invalid());
+        return None;
     }
     let nanos = start.nanos + timeout.nanos;
     let seconds = start
         .seconds
         .checked_add(timeout.seconds)
         .and_then(|s| s.checked_add(i64::from(nanos / 1_000_000_000)))
-        .filter(|s| *s <= 253_402_300_799)
-        .ok_or_else(invalid)?;
-    Ok(Timestamp {
+        .filter(|s| *s <= 253_402_300_799)?;
+    Some(Timestamp {
         seconds,
         nanos: nanos % 1_000_000_000,
     })

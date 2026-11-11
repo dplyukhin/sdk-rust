@@ -2,12 +2,11 @@
 
 use super::{
     HistoryFeeder, HistoryForReplay, ReplayWorkerInput,
-    model::{ModelError, ModelEvent, ModelHistory},
+    model::{ActivitySamples, ModelError, ModelEvent, ModelHistory},
 };
 use crate::{Worker, WorkerConfig, WorkflowTaskCompletion, init_replay_worker};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use temporalio_common::protos::temporal::api::{
-    common::v1::Payloads,
     enums::v1::TimeoutType,
     failure::v1::{Failure, TimeoutFailureInfo, failure},
     history::v1::{History, WorkflowExecutionSignaledEventAttributes},
@@ -98,13 +97,13 @@ impl WorkflowCheck {
     /// Every configured signal remains eligible at every open frontier. Timer and activity
     /// resolutions are explored before incoming signals, so repeated signals cannot monopolize
     /// the search. Activity implementations are never executed; results come from the supplied
-    /// payload sets. This prototype explores singleton event batches only.
+    /// outcome sets. This prototype explores singleton event batches only.
     pub async fn run(
         &mut self,
         workflow_id: &str,
         initial: ModelHistory,
         signals: &[WorkflowExecutionSignaledEventAttributes],
-        activity_results: &BTreeMap<String, Vec<Payloads>>,
+        activity_samples: &BTreeMap<String, ActivitySamples>,
         limits: CheckLimits,
     ) -> Result<Option<Counterexample>, CheckError> {
         if limits.max_checks == 0 || limits.timeout.is_zero() || limits.task_timeout.is_zero() {
@@ -164,7 +163,7 @@ impl WorkflowCheck {
             let choices = settled
                 .timer_choices()
                 .into_iter()
-                .chain(settled.activity_choices(activity_results)?)
+                .chain(settled.activity_choices(activity_samples)?)
                 .chain(signals.iter().cloned().map(ModelEvent::Signal))
                 .collect::<Vec<_>>();
             for choice in choices.into_iter().rev() {

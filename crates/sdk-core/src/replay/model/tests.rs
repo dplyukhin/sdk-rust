@@ -22,8 +22,8 @@ use temporalio_common::protos::{
             RecordMarkerCommandAttributes, ScheduleActivityTaskCommandAttributes,
             StartTimerCommandAttributes, UpsertWorkflowSearchAttributesCommandAttributes,
         },
-        common::v1::{ActivityType, Memo, Payload, Payloads, SearchAttributes},
-        failure::v1::Failure,
+        common::v1::{ActivityType, Memo, Payload, Payloads, RetryPolicy, SearchAttributes},
+        failure::v1::{ApplicationFailureInfo, Failure, TimeoutFailureInfo},
         sdk::v1::WorkflowTaskCompletedMetadata,
         taskqueue::v1::TaskQueue,
     },
@@ -466,7 +466,10 @@ fn remote_activity_results_branch_without_mutating_the_schedule() {
         .unwrap();
     let samples = BTreeMap::from([(
         "model-activity".to_owned(),
-        vec![payloads("one"), payloads("two")],
+        ActivitySamples {
+            results: vec![payloads("one"), payloads("two")],
+            ..Default::default()
+        },
     )]);
     let choices = root.activity_choices(&samples).unwrap();
     assert_eq!(choices.len(), 4);
@@ -529,7 +532,10 @@ fn remote_activity_schedules_require_samples_and_unique_live_ids() {
         Err(ModelError::MissingActivityResults(name)) if name == "model-activity"
     );
     assert_matches!(
-        root.activity_choices(&BTreeMap::from([("model-activity".to_owned(), vec![])])),
+        root.activity_choices(&BTreeMap::from([(
+            "model-activity".to_owned(),
+            ActivitySamples::default(),
+        )])),
         Err(ModelError::MissingActivityResults(_))
     );
     assert_matches!(
@@ -554,6 +560,163 @@ fn remote_activity_schedules_require_samples_and_unique_live_ids() {
         Err(ModelError::InvalidCommand(
             CommandType::ScheduleActivityTask
         ))
+    );
+}
+
+#[test]
+fn failed_and_timed_out_activity_branches_are_terminal_and_isolated() {
+    let mut schedule = activity("remote");
+    let command::Attributes::ScheduleActivityTaskCommandAttributes(attributes) = &mut schedule
+    else {
+        unreachable!()
+    };
+    attributes.retry_policy = Some(RetryPolicy {
+        maximum_attempts: 1,
+        ..Default::default()
+    });
+    let root = initial()
+        .complete_task(&completion(vec![schedule]))
+        .unwrap();
+    let application_failure = Failure {
+        message: "declined".to_owned(),
+        failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: "Declined".to_owned(),
+                details: Some(payloads("failure details")),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let timeout = Failure {
+        failure_info: Some(failure::FailureInfo::TimeoutFailureInfo(
+            TimeoutFailureInfo {
+                timeout_type: TimeoutType::StartToClose as i32,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let samples = BTreeMap::from([(
+        "model-activity".to_owned(),
+        ActivitySamples {
+            results: vec![payloads("accepted")],
+            failures: vec![application_failure.clone(), timeout.clone()],
+        },
+    )]);
+    let choices = root.activity_choices(&samples).unwrap();
+    assert_eq!(choices.len(), 3);
+    for choice in &choices[1..] {
+        let branch = root.extend(std::slice::from_ref(choice)).unwrap();
+        let started = &branch.history.events[5];
+        let resolved = &branch.history.events[6];
+        match resolved.attributes.as_ref().unwrap() {
+            history_event::Attributes::ActivityTaskFailedEventAttributes(a) => {
+                assert_eq!(a.failure.as_ref(), Some(&application_failure));
+                assert_eq!(a.scheduled_event_id, 5);
+                assert_eq!(a.started_event_id, started.event_id);
+                assert_eq!(a.retry_state(), RetryState::MaximumAttemptsReached);
+                assert_eq!(resolved.event_time, started.event_time);
+            }
+            history_event::Attributes::ActivityTaskTimedOutEventAttributes(a) => {
+                assert_eq!(a.failure.as_ref(), Some(&timeout));
+                assert_eq!(a.scheduled_event_id, 5);
+                assert_eq!(a.started_event_id, started.event_id);
+                assert_eq!(a.retry_state(), RetryState::MaximumAttemptsReached);
+                assert_eq!(
+                    resolved.event_time.unwrap().seconds - started.event_time.unwrap().seconds,
+                    10
+                );
+            }
+            other => panic!("unexpected activity outcome: {other:?}"),
+        }
+        let settled = branch.complete_task(&completion(vec![])).unwrap();
+        assert!(
+            settled
+                .activity_choices(&BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_matches!(
+            settled.extend(std::slice::from_ref(choice)),
+            Err(ModelError::ActivityNotPending(5))
+        );
+        assert_eq!(root.pending_activities().len(), 1);
+    }
+}
+
+#[test]
+fn activity_failures_must_not_silently_skip_retries() {
+    let root = initial()
+        .complete_task(&completion(vec![activity("remote")]))
+        .unwrap();
+    let mut failure = Failure {
+        failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: "Declined".to_owned(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    assert_matches!(
+        root.extend(&[ModelEvent::FailActivity {
+            scheduled_event_id: 5,
+            failure: failure.clone()
+        }]),
+        Err(ModelError::UnsupportedActivityFailure(_))
+    );
+    let mut schedule = activity("remote");
+    let command::Attributes::ScheduleActivityTaskCommandAttributes(attributes) = &mut schedule
+    else {
+        unreachable!()
+    };
+    attributes.retry_policy = Some(RetryPolicy {
+        non_retryable_error_types: vec!["Declined".to_owned()],
+        ..Default::default()
+    });
+    let branch = initial()
+        .complete_task(&completion(vec![schedule]))
+        .unwrap()
+        .extend(&[ModelEvent::FailActivity {
+            scheduled_event_id: 5,
+            failure: failure.clone(),
+        }])
+        .unwrap();
+    assert_matches!(
+        branch.history.events[6].attributes.as_ref(),
+        Some(history_event::Attributes::ActivityTaskFailedEventAttributes(a))
+            if a.retry_state() == RetryState::NonRetryableFailure
+    );
+    let Some(failure::FailureInfo::ApplicationFailureInfo(info)) = &mut failure.failure_info else {
+        unreachable!()
+    };
+    info.non_retryable = true;
+    let branch = root
+        .extend(&[ModelEvent::FailActivity {
+            scheduled_event_id: 5,
+            failure,
+        }])
+        .unwrap();
+    assert_matches!(
+        branch.history.events[6].attributes.as_ref(),
+        Some(history_event::Attributes::ActivityTaskFailedEventAttributes(a))
+            if a.retry_state() == RetryState::NonRetryableFailure
+    );
+    assert_matches!(
+        root.extend(&[ModelEvent::FailActivity {
+            scheduled_event_id: 5,
+            failure: Failure {
+                failure_info: Some(failure::FailureInfo::TimeoutFailureInfo(
+                    TimeoutFailureInfo {
+                        timeout_type: TimeoutType::Heartbeat as i32,
+                        ..Default::default()
+                    }
+                )),
+                ..Default::default()
+            },
+        }]),
+        Err(ModelError::UnsupportedActivityFailure(_))
     );
 }
 
